@@ -48,45 +48,79 @@ def _get_artifacts_dir(config: Dict[str, Any]) -> Path:
 
 
 def _load_active_model_details(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Retrieve active model identifier and performance metadata."""
+    """Retrieve active model identifier and v2 performance metadata (endpoint evaluation)."""
     models_dir = _get_artifacts_dir(config)
     details = {
-        "version": "v1.0.0",
-        "algorithm": "GradientBoostingRegressor",
-        "trained_at": "Initial Baseline",
-        "test_mae": 15.42,
-        "test_rmse": 19.85,
-        "nasa_score": 482.1,
+        "version": "v2.0.0",
+        "algorithm": "Unknown",
+        "trained_at": "—",
+        "eval_protocol": "endpoint",
+        "rul_cap": 125,
+        "val_ep_mae": None,
+        "val_ep_rmse": None,
+        "test_ep_mae": None,
+        "test_ep_rmse": None,
+        "test_ep_nasa": None,
+        "test_ep_late_pct": None,
+        "val_row_mae": None,
+        "test_row_mae": None,
+        "feature_count": 218,
+        "trained_models_count": 6,
+        "dataset_id": "FD001",
         "status": "ACTIVE_PRODUCTION",
-        "features_count": 14,
     }
 
     active_file = models_dir / "active_model.txt"
+    active_version = None
     if active_file.exists():
         try:
-            details["version"] = active_file.read_text().strip()
+            active_version = active_file.read_text().strip()
+            details["version"] = active_version
         except Exception:
             pass
 
-    for meta_name in ["metadata.json", "champion_metadata.json", "model_metadata.json"]:
-        meta_file = models_dir / meta_name
+    meta_candidates = []
+    if active_version:
+        meta_candidates.append(models_dir / active_version / "metadata.json")
+    meta_candidates += [models_dir / "metadata.json", models_dir / "champion_metadata.json"]
+
+    for meta_file in meta_candidates:
         if meta_file.exists():
             try:
                 with open(meta_file, "r", encoding="utf-8") as f:
                     meta = json.load(f)
-                    details["version"] = meta.get("model_version", details["version"])
-                    details["algorithm"] = meta.get("model_type", meta.get("algorithm", details["algorithm"]))
-                    details["trained_at"] = meta.get("trained_at", meta.get("timestamp", details["trained_at"]))
-                    details["test_mae"] = float(meta.get("test_mae", meta.get("mae", details["test_mae"])))
-                    details["test_rmse"] = float(meta.get("test_rmse", meta.get("rmse", details["test_rmse"])))
-                    details["nasa_score"] = float(meta.get("nasa_score", details["nasa_score"]))
-                    if "features" in meta:
-                        details["features_count"] = len(meta["features"])
-                    break
+                details["algorithm"] = meta.get("model_type", meta.get("algorithm", details["algorithm"]))
+                details["trained_at"] = meta.get("created_at", meta.get("trained_at", details["trained_at"]))
+                details["eval_protocol"] = meta.get("eval_protocol", "row_level")
+                details["rul_cap"] = meta.get("rul_cap", 125)
+                details["dataset_id"] = meta.get("dataset_id", "FD001")
+                details["feature_count"] = meta.get("feature_count", 218)
+                details["trained_models_count"] = meta.get("trained_models_count", 1)
+
+                ep_val  = meta.get("val_endpoint_metrics") or meta.get("validation_metrics") or {}
+                ep_test = meta.get("test_endpoint_metrics") or meta.get("test_metrics") or {}
+
+                details["val_ep_mae"]       = ep_val.get("mae")
+                details["val_ep_rmse"]      = ep_val.get("rmse")
+                details["test_ep_mae"]      = ep_test.get("mae")
+                details["test_ep_rmse"]     = ep_test.get("rmse")
+                details["test_ep_nasa"]     = ep_test.get("nasa_score")
+                details["test_ep_late_pct"] = ep_test.get("late_pct")
+
+                row_val  = meta.get("val_row_metrics", {})
+                row_test = meta.get("test_row_metrics", {})
+                details["val_row_mae"]  = row_val.get("mae")
+                details["test_row_mae"] = row_test.get("mae")
+
+                if details["test_ep_mae"] is None:
+                    details["test_ep_mae"]  = meta.get("test_mae") or meta.get("mae")
+                    details["test_ep_rmse"] = meta.get("test_rmse") or meta.get("rmse")
+                break
             except Exception:
                 pass
 
     return details
+
 
 
 def _load_run_history(config: Dict[str, Any]) -> pd.DataFrame:
@@ -249,42 +283,92 @@ def render_model_monitoring(config: Dict[str, Any]) -> None:
         unsafe_allow_html=True,
     )
 
-    # Active Champion Model Card
+    # Active Champion Model Card — v2 endpoint metrics
     active_info = _load_active_model_details(config)
 
-    st.markdown("##### 🏆 Current Active Champion Model")
-    card_col1, card_col2, card_col3, card_col4 = st.columns(4)
+    # Helper to format optional metric
+    def fmt(v, suffix="", dec=2):
+        return f"{float(v):.{dec}f}{suffix}" if v is not None else "—"
 
-    with card_col1:
+    st.markdown("##### 🏆 Active Champion Model — v2 (Endpoint Evaluation)")
+
+    # Row 1: Model identity
+    id_col1, id_col2, id_col3, id_col4 = st.columns(4)
+    with id_col1:
         render_kpi_card(
             label="Champion Model",
-            value=active_info["version"],
+            value=active_info["version"][:24] if len(active_info["version"]) > 24 else active_info["version"],
             delta=active_info["algorithm"],
             color="#22c55e",
         )
-    with card_col2:
+    with id_col2:
         render_kpi_card(
-            label="Validation MAE",
-            value=f"{float(active_info['test_mae']):.2f} cyc",
-            delta="Lower is better",
+            label="Dataset",
+            value=active_info["dataset_id"],
+            delta=f"RUL cap: {active_info['rul_cap']} cycles",
             color="#38bdf8",
         )
-    with card_col3:
+    with id_col3:
         render_kpi_card(
-            label="Root Mean Sq Error (RMSE)",
-            value=f"{float(active_info['test_rmse']):.2f} cyc",
-            delta="Test split error",
+            label="Feature Count",
+            value=str(active_info["feature_count"]),
+            delta=f"{active_info['trained_models_count']} models compared",
             color="#a855f7",
         )
-    with card_col4:
+    with id_col4:
+        eval_proto = active_info["eval_protocol"].replace("_", "-").title()
         render_kpi_card(
-            label="NASA Score",
-            value=f"{float(active_info['nasa_score']):.1f}",
-            delta=f"Trained: {active_info['trained_at'][:10]}",
+            label="Eval Protocol",
+            value=eval_proto,
+            delta=f"Trained: {str(active_info['trained_at'])[:10]}",
             color="#f59e0b",
         )
 
-    st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+
+    # Row 2: Performance metrics (endpoint = honest C-MAPSS protocol)
+    st.markdown("**Performance — Endpoint Evaluation (last cycle per engine)**")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        render_kpi_card(
+            label="Val Endpoint MAE",
+            value=fmt(active_info["val_ep_mae"], " cyc"),
+            delta="20 val engines (endpoint)",
+            color="#22c55e",
+        )
+    with m2:
+        render_kpi_card(
+            label="Test Endpoint MAE",
+            value=fmt(active_info["test_ep_mae"], " cyc"),
+            delta="100 test engines (official)",
+            color="#ef4444",
+        )
+    with m3:
+        render_kpi_card(
+            label="Test Endpoint RMSE",
+            value=fmt(active_info["test_ep_rmse"], " cyc"),
+            delta="Lower = better",
+            color="#f59e0b",
+        )
+    with m4:
+        render_kpi_card(
+            label="Late Predictions",
+            value=fmt(active_info["test_ep_late_pct"], "%", dec=1),
+            delta="% of engines predicted late",
+            color="#8b5cf6",
+        )
+
+    # Row 3: Row-level vs endpoint comparison callout
+    if active_info["val_row_mae"] is not None and active_info["val_ep_mae"] is not None:
+        row_mae = float(active_info["val_row_mae"])
+        ep_mae  = float(active_info["val_ep_mae"])
+        st.info(
+            f"ℹ️ **Evaluation gap:** Row-level val MAE = {row_mae:.2f} cycles (all cycles, easy high-RUL rows) "
+            f"vs Endpoint val MAE = {ep_mae:.2f} cycles (last cycle only, matches test protocol). "
+            "The endpoint metric is the honest production indicator."
+        )
+
+
 
     # Experiment Run History Section
     st.markdown("### 🧪 MLflow Experiment Run History")
