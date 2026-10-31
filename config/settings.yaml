@@ -1,0 +1,117 @@
+# Self-Healing Machines — Project Configuration
+
+# ─── Paths ───────────────────────────────────────────────────────────────────
+paths:
+  raw_data_dir: "../CMAPSSData"          # Relative to project root
+  processed_data_dir: "data/processed"
+  artifacts_dir: "artifacts/models"
+  logs_dir: "logs"
+  reports_dir: "reports"
+  figures_dir: "reports/figures"
+  metrics_dir: "reports/metrics"
+  database: "data/maintenance.db"
+  mlflow_tracking_uri: "mlruns"
+
+# ─── Dataset ─────────────────────────────────────────────────────────────────
+dataset:
+  default_subset: "FD001"
+  subsets: ["FD001", "FD002", "FD003", "FD004"]
+  column_names:
+    - engine_id
+    - cycle
+    - op_setting_1
+    - op_setting_2
+    - op_setting_3
+    - sensor_1
+    - sensor_2
+    - sensor_3
+    - sensor_4
+    - sensor_5
+    - sensor_6
+    - sensor_7
+    - sensor_8
+    - sensor_9
+    - sensor_10
+    - sensor_11
+    - sensor_12
+    - sensor_13
+    - sensor_14
+    - sensor_15
+    - sensor_16
+    - sensor_17
+    - sensor_18
+    - sensor_19
+    - sensor_20
+    - sensor_21
+
+# ─── Feature Engineering ─────────────────────────────────────────────────────
+features:
+  # Sensors known to be informative for FD001 (non-constant variance)
+  selected_sensors:
+    - sensor_2
+    - sensor_3
+    - sensor_4
+    - sensor_7
+    - sensor_8
+    - sensor_9
+    - sensor_11
+    - sensor_12
+    - sensor_13
+    - sensor_14
+    - sensor_15
+    - sensor_17
+    - sensor_20
+    - sensor_21
+  include_op_settings: true
+  rolling_windows: [5, 10, 20]           # Cycles for rolling mean/std
+  trend_window: 5                        # Window for recent change/trend
+
+# ─── RUL Target ──────────────────────────────────────────────────────────────
+rul:
+  cap_value: 125                         # Max RUL cap (set null to disable)
+  use_capped: true
+
+# ─── Train/Validation Split ──────────────────────────────────────────────────
+split:
+  validation_fraction: 0.2
+  random_seed: 42
+
+# ─── Models ──────────────────────────────────────────────────────────────────
+models:
+  linear_regression:
+    fit_intercept: true
+  random_forest:
+    n_estimators: 100
+    max_depth: 10
+    min_samples_split: 5
+    min_samples_leaf: 2
+    random_state: 42
+    n_jobs: -1
+  gradient_boosting:
+    n_estimators: 100
+    max_depth: 5
+    learning_rate: 0.1
+    random_state: 42
+
+# ─── Anomaly Detection ───────────────────────────────────────────────────────
+anomaly:
+  contamination: 0.05                   # Expected anomaly fraction in training
+  n_estimators: 100
+  random_state: 42
+  threshold_percentile: 10             # Percentile of training scores as threshold
+
+# ─── Triage Agent ────────────────────────────────────────────────────────────
+triage:
+  critical_rul_threshold: 15           # RUL <= this → Critical
+  warning_rul_threshold: 40            # RUL <= this → Warning
+  anomaly_score_threshold: -0.05       # Score below this → anomaly flag
+
+# ─── MLflow ──────────────────────────────────────────────────────────────────
+mlflow:
+  experiment_name: "self_healing_machines"
+  model_name: "rul_predictor"
+
+# ─── Model Promotion ─────────────────────────────────────────────────────────
+promotion:
+  # Candidate must improve MAE by at least this fraction to be promoted
+  min_mae_improvement_fraction: 0.01
