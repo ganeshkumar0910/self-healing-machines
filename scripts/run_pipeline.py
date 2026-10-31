@@ -1,12 +1,21 @@
-"""Command Line Interface (CLI) for executing the predictive maintenance pipeline end-to-end."""
+"""Command Line Interface (CLI) for executing the predictive maintenance pipeline end-to-end.
+
+v2 improvements:
+- Endpoint-level evaluation (last cycle per engine) matching official C-MAPSS test protocol
+- Six CPU-only models: Linear, RF, GB, ExtraTrees, HistGB, XGBoost
+- Ensemble uncertainty (std across models) added to predictions
+- Prediction floor: no negative RUL predictions
+- Consistent RUL cap between training and evaluation
+"""
 
 import argparse
 from datetime import datetime, timezone
+import json
 import logging
 from pathlib import Path
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # Add project root to path for src package imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -32,10 +41,16 @@ from src.models.model_registry import (
 )
 from src.models.prediction_service import PredictionService
 from src.models.rul_model import (
+    ExtraTreesRULModel,
     GradientBoostingRULModel,
+    HistGradientBoostingRULModel,
     LinearRULModel,
     RandomForestRULModel,
+    XGBoostRULModel,
+    compute_ensemble_uncertainty,
+    evaluate_endpoint,
     evaluate_model,
+    evaluate_by_rul_range,
 )
 
 logging.basicConfig(
@@ -197,50 +212,103 @@ def step_train(config: Dict[str, Any], dataset_id: str = "FD001") -> Dict[str, A
     )
 
     models_cfg = config.get("models", {})
-    candidates = [
+    rul_cap = config.get("rul", {}).get("cap_value", 125) if config.get("rul", {}).get("use_capped", True) else None
+
+    # Build all 6 CPU-only candidate models
+    candidates: List[Any] = [
         LinearRULModel(**models_cfg.get("linear_regression", {})),
         RandomForestRULModel(**models_cfg.get("random_forest", {})),
         GradientBoostingRULModel(**models_cfg.get("gradient_boosting", {})),
+        ExtraTreesRULModel(**models_cfg.get("extra_trees", {})),
+        HistGradientBoostingRULModel(**models_cfg.get("hist_gradient_boosting", {})),
     ]
+    # Try XGBoost — skip gracefully if not available
+    try:
+        xgb_model = XGBoostRULModel(**models_cfg.get("xgboost", {}))
+        candidates.append(xgb_model)
+        logger.info("XGBoost available — adding as candidate.")
+    except Exception as exc:
+        logger.warning("XGBoost skipped: %s", exc)
 
     results: Dict[str, Any] = {}
+    trained_models: List[Any] = []
     best_model = None
-    best_val_mae = float("inf")
+    best_val_endpoint_mae = float("inf")
     best_name = ""
 
     artifact_rel = config.get("paths", {}).get("artifacts_dir", "artifacts/models")
     artifact_dir = (root / artifact_rel).resolve()
 
-    logger.info("Evaluating %d candidate models...", len(candidates))
+    logger.info("Evaluating %d candidate models (CPU-only)...", len(candidates))
     for model in candidates:
         m_name = model.model_type
         logger.info("--- Training: %s ---", m_name)
-        model.fit(X_train, y_train)
+        try:
+            train_secs = model.fit_timed(X_train, y_train)
+        except Exception as exc:
+            logger.error("Training failed for %s: %s — skipping.", m_name, exc)
+            continue
 
+        # Row-level metrics (all cycles of validation engines)
         val_preds = model.predict(X_val)
-        val_metrics = evaluate_model(y_val, val_preds)
+        val_row_metrics = evaluate_model(y_val, val_preds)
 
+        # Endpoint-level metrics (last cycle per engine — matches official test protocol)
+        val_split_with_preds = val_split.copy()
+        val_split_with_preds["predicted_rul"] = val_preds
+        val_endpoint_metrics = evaluate_endpoint(
+            val_split_with_preds, rul_cap=rul_cap
+        )
+
+        # Official test set metrics
         test_preds = model.predict(X_test)
         test_metrics = evaluate_model(y_test, test_preds)
+        df_test_with_preds = df_test_features.copy()
+        df_test_with_preds["predicted_rul"] = test_preds
+        test_endpoint_metrics = evaluate_endpoint(
+            df_test_with_preds, rul_cap=rul_cap
+        )
+
+        # RUL range breakdown (diagnostic)
+        rul_range_metrics = evaluate_by_rul_range(y_val, val_preds)
 
         results[m_name] = {
-            "val_metrics": val_metrics,
-            "test_metrics": test_metrics,
+            "val_row_metrics": val_row_metrics,
+            "val_endpoint_metrics": val_endpoint_metrics,
+            "test_row_metrics": test_metrics,
+            "test_endpoint_metrics": test_endpoint_metrics,
+            "rul_range_metrics": rul_range_metrics,
+            "training_seconds": train_secs,
         }
+        trained_models.append(model)
 
         # Log run to MLflow
         with exp_tracker:
-            exp_tracker.start_run(run_name=f"{m_name}_{dataset_id}")
-            exp_tracker.log_params(model.get_params())
-            exp_tracker.log_metrics({f"val_{k}": v for k, v in val_metrics.items()})
-            exp_tracker.log_metrics({f"test_{k}": v for k, v in test_metrics.items()})
+            exp_tracker.start_run(run_name=f"{m_name}_{dataset_id}_v2")
+            exp_tracker.log_params({**model.get_params(), "training_seconds": train_secs,
+                                     "feature_count": len(feature_cols), "dataset_id": dataset_id,
+                                     "eval_protocol": "endpoint", "rul_cap": rul_cap})
+            exp_tracker.log_metrics({f"val_row_{k}": v for k, v in val_row_metrics.items()})
+            exp_tracker.log_metrics({f"val_ep_{k}": v for k, v in val_endpoint_metrics.items()})
+            exp_tracker.log_metrics({f"test_row_{k}": v for k, v in test_metrics.items()})
+            exp_tracker.log_metrics({f"test_ep_{k}": v for k, v in test_endpoint_metrics.items()})
 
-        if val_metrics["mae"] < best_val_mae:
-            best_val_mae = val_metrics["mae"]
+        # Use ENDPOINT val MAE for model selection (honest protocol)
+        ep_mae = val_endpoint_metrics["mae"]
+        if ep_mae < best_val_endpoint_mae:
+            best_val_endpoint_mae = ep_mae
             best_model = model
             best_name = m_name
 
-    logger.info("Best model selected: %s (Validation MAE: %.3f)", best_name, best_val_mae)
+    logger.info("Best model selected: %s (Endpoint Val MAE: %.3f)", best_name, best_val_endpoint_mae)
+
+    # Compute ensemble uncertainty using all successfully trained models
+    unc_cfg = config.get("uncertainty", {})
+    ensemble_uncertainty = None
+    if unc_cfg.get("enabled", True) and len(trained_models) >= 2:
+        logger.info("Computing ensemble uncertainty across %d models...", len(trained_models))
+        ensemble_uncertainty = compute_ensemble_uncertainty(trained_models, X_test)
+        logger.info("Ensemble uncertainty computed. Mean std=%.3f", ensemble_uncertainty["std"].mean())
 
     # Save active best model artifact
     version_id = f"{best_name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
@@ -250,28 +318,49 @@ def step_train(config: Dict[str, Any], dataset_id: str = "FD001") -> Dict[str, A
         feature_cols=feature_cols,
         metadata={
             "model_type": best_name,
-            "validation_metrics": results[best_name]["val_metrics"],
-            "test_metrics": results[best_name]["test_metrics"],
+            "eval_protocol": "endpoint",
+            "rul_cap": rul_cap,
+            "val_endpoint_metrics": results[best_name]["val_endpoint_metrics"],
+            "val_row_metrics": results[best_name]["val_row_metrics"],
+            "test_endpoint_metrics": results[best_name]["test_endpoint_metrics"],
+            "test_row_metrics": results[best_name]["test_row_metrics"],
+            "validation_metrics": results[best_name]["val_endpoint_metrics"],  # backward compat
+            "test_metrics": results[best_name]["test_endpoint_metrics"],       # backward compat
+            "feature_count": len(feature_cols),
+            "trained_models_count": len(trained_models),
             "dataset_id": dataset_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "model_name": version_id,
         },
         artifact_dir=artifact_dir,
         model_name=version_id,
     )
     set_active_model(artifact_dir, version_id)
 
-    # Print summary metrics table
-    print("\n" + "=" * 70)
-    print(f" MODEL EVALUATION SUMMARY — DATASET {dataset_id}")
-    print("=" * 70)
-    print(f"{'Model':<22} | {'Val MAE':<10} | {'Val RMSE':<10} | {'Test MAE':<10} | {'Test RMSE':<10}")
-    print("-" * 70)
+    # Save ensemble uncertainty to disk for dashboard
+    if ensemble_uncertainty is not None:
+        unc_out = proc_dir / f"ensemble_uncertainty_{dataset_id}.npz"
+        np.savez(unc_out, **ensemble_uncertainty)
+        logger.info("Saved ensemble uncertainty to %s", unc_out)
+
+    # Print comprehensive summary table
+    print("\n" + "=" * 95)
+    print(f" MODEL EVALUATION SUMMARY — DATASET {dataset_id}  (CPU-only)")
+    print("=" * 95)
+    print(f"{'Model':<26} | {'Val EP-MAE':>10} | {'Val EP-RMSE':>11} | {'Test EP-MAE':>11} | {'Test EP-RMSE':>12} | {'Train(s)':>8}")
+    print("-" * 95)
     for name, res in results.items():
-        v = res["val_metrics"]
-        t = res["test_metrics"]
-        print(f"{name:<22} | {v['mae']:<10.3f} | {v['rmse']:<10.3f} | {t['mae']:<10.3f} | {t['rmse']:<10.3f}")
-    print("=" * 70)
-    print(f"Active Production Model: {version_id} at {saved_path}\n")
+        v = res["val_endpoint_metrics"]
+        t = res["test_endpoint_metrics"]
+        ts = res["training_seconds"]
+        marker = " *" if name == best_name else ""
+        print(f"{name+marker:<26} | {v['mae']:>10.3f} | {v['rmse']:>11.3f} | {t['mae']:>11.3f} | {t['rmse']:>12.3f} | {ts:>8.1f}")
+    print("=" * 95)
+    print(f"\n* Champion: {version_id}")
+    print(f"  Endpoint Val  MAE={results[best_name]['val_endpoint_metrics']['mae']:.3f}  RMSE={results[best_name]['val_endpoint_metrics']['rmse']:.3f}")
+    print(f"  Endpoint Test MAE={results[best_name]['test_endpoint_metrics']['mae']:.3f}  RMSE={results[best_name]['test_endpoint_metrics']['rmse']:.3f}")
+    print(f"  Late predictions (val endpoint): {results[best_name]['val_endpoint_metrics']['late_pct']:.1f}%")
+    print(f"  Artifact: {saved_path}\n")
 
     logger.info("Training step completed in %.2fs", time.time() - t0)
     return {
@@ -310,6 +399,29 @@ def step_predict(config: Dict[str, Any], dataset_id: str = "FD001") -> Path:
     )
 
     df_predictions = prediction_service.predict_batch(df_test_features)
+
+    # Merge pre-computed ensemble uncertainty if available
+    unc_path = proc_dir / f"ensemble_uncertainty_{dataset_id}.npz"
+    if unc_path.is_file():
+        unc_data = np.load(unc_path)
+        if len(unc_data["std"]) == len(df_predictions):
+            df_predictions["rul_uncertainty"] = unc_data["std"]
+            df_predictions["rul_lower"] = unc_data["lower"]
+            df_predictions["rul_upper"] = unc_data["upper"]
+            logger.info("Ensemble uncertainty merged into predictions.")
+        else:
+            logger.warning(
+                "Uncertainty array length mismatch (%d vs %d) — skipping merge.",
+                len(unc_data["std"]), len(df_predictions),
+            )
+    else:
+        df_predictions["rul_uncertainty"] = 0.0
+        df_predictions["rul_lower"] = df_predictions["predicted_rul"]
+        df_predictions["rul_upper"] = df_predictions["predicted_rul"]
+
+    # Ensure no negative RUL predictions
+    df_predictions["predicted_rul"] = df_predictions["predicted_rul"].clip(lower=0.0)
+
     pred_out = proc_dir / "predictions.csv"
     df_predictions.to_csv(pred_out, index=False)
 
@@ -320,6 +432,7 @@ def step_predict(config: Dict[str, Any], dataset_id: str = "FD001") -> Path:
         pred_out,
     )
     return pred_out
+
 
 
 def step_triage(config: Dict[str, Any], dataset_id: str = "FD001") -> Path:

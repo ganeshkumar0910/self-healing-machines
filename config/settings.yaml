@@ -1,4 +1,5 @@
-# Self-Healing Machines — Project Configuration
+# Self-Healing Machines — Project Configuration v2
+# All tunable parameters live here. No hardcoded values in Python source.
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 paths:
@@ -7,6 +8,7 @@ paths:
   artifacts_dir: "artifacts/models"
   logs_dir: "logs"
   reports_dir: "reports"
+  improvement_dir: "reports/improvement"
   figures_dir: "reports/figures"
   metrics_dir: "reports/metrics"
   database: "data/maintenance.db"
@@ -44,9 +46,9 @@ dataset:
     - sensor_20
     - sensor_21
 
-# ─── Feature Engineering ─────────────────────────────────────────────────────
+# ─── Feature Engineering v2 ──────────────────────────────────────────────────
 features:
-  # Sensors known to be informative for FD001 (non-constant variance)
+  # Sensors with non-constant variance in FD001 (verified by std analysis)
   selected_sensors:
     - sensor_2
     - sensor_3
@@ -63,48 +65,101 @@ features:
     - sensor_20
     - sensor_21
   include_op_settings: true
-  rolling_windows: [5, 10, 20]           # Cycles for rolling mean/std
-  trend_window: 5                        # Window for recent change/trend
+  rolling_windows: [5, 10, 20]           # Cycles for rolling statistics
+  trend_window: 5                        # Lag window for trend/slope
+  include_rolling_minmax: true           # Rolling min and max (v2)
+  include_ema: true                      # Exponential moving average (v2)
+  ema_alpha: 0.1                         # EMA smoothing factor (v2)
+  include_sensor_diffs: true             # Physically meaningful sensor differences (v2)
+  include_cycle_pct: true                # Cycle / max_cycle ratio (degradation stage) (v2)
 
 # ─── RUL Target ──────────────────────────────────────────────────────────────
 rul:
-  cap_value: 125                         # Max RUL cap (set null to disable)
+  cap_value: 125                         # Training RUL cap (standard C-MAPSS practice)
   use_capped: true
+  # Evaluation: report metrics both with and without RUL cap for honesty
+  eval_with_cap: true                    # Cap test RUL to match training distribution
+  eval_without_cap: true                 # Also report uncapped metrics for literature comparison
 
 # ─── Train/Validation Split ──────────────────────────────────────────────────
 split:
   validation_fraction: 0.2
   random_seed: 42
+  # Evaluation protocol: endpoint = last-cycle-only (matches official test); row = all cycles
+  endpoint_eval: true                    # Report endpoint (per-engine last-cycle) MAE (v2)
+  row_level_eval: true                   # Also report row-level MAE (for monitoring)
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 models:
   linear_regression:
     fit_intercept: true
   random_forest:
-    n_estimators: 100
+    n_estimators: 150
     max_depth: 10
     min_samples_split: 5
     min_samples_leaf: 2
     random_state: 42
     n_jobs: -1
   gradient_boosting:
-    n_estimators: 100
-    max_depth: 5
-    learning_rate: 0.1
+    n_estimators: 200
+    max_depth: 4
+    learning_rate: 0.05
+    subsample: 0.8
+    min_samples_leaf: 10
     random_state: 42
+  extra_trees:                           # New in v2
+    n_estimators: 200
+    max_depth: 12
+    min_samples_split: 4
+    min_samples_leaf: 2
+    random_state: 42
+    n_jobs: -1
+  hist_gradient_boosting:                # New in v2 — fastest CPU GB
+    max_iter: 300
+    max_depth: 6
+    learning_rate: 0.05
+    min_samples_leaf: 20
+    l2_regularization: 0.1
+    random_state: 42
+  xgboost:                               # New in v2 — CPU hist method
+    n_estimators: 300
+    max_depth: 5
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    random_state: 42
+
+# ─── Hyperparameter Tuning ───────────────────────────────────────────────────
+tuning:
+  enabled: false                         # Set true to run RandomizedSearchCV
+  n_iter: 20                             # Number of random search iterations (CPU budget)
+  cv_folds: 3                            # Engine-wise CV folds
+  random_state: 42
+  scoring: "neg_mean_absolute_error"
+  n_jobs: -1                             # Use all CPU cores
+  tune_models: ["gradient_boosting", "hist_gradient_boosting", "xgboost"]
 
 # ─── Anomaly Detection ───────────────────────────────────────────────────────
 anomaly:
-  contamination: 0.05                   # Expected anomaly fraction in training
+  contamination: 0.05                    # Expected anomaly fraction in training
   n_estimators: 100
   random_state: 42
-  threshold_percentile: 10             # Percentile of training scores as threshold
+  threshold_percentile: 10              # Val-set percentile below which = anomaly
 
 # ─── Triage Agent ────────────────────────────────────────────────────────────
 triage:
-  critical_rul_threshold: 15           # RUL <= this → Critical
-  warning_rul_threshold: 40            # RUL <= this → Warning
-  anomaly_score_threshold: -0.05       # Score below this → anomaly flag
+  critical_rul_threshold: 15            # RUL <= this → Critical (Emergency Maintenance)
+  warning_rul_threshold: 40             # RUL <= this → Warning (Planned Maintenance)
+  anomaly_score_threshold: -0.05        # Score below this → InspectionReview
+  uncertainty_threshold: 25.0           # Ensemble std above this → UncertaintyReview (v2)
+                                        # Set to 999 to disable uncertainty rule
+
+# ─── Uncertainty Estimation ──────────────────────────────────────────────────
+uncertainty:
+  enabled: true                         # Compute ensemble prediction std
+  ci_factor: 1.64                       # 1.64 ≈ 90% coverage; 1.96 ≈ 95%
 
 # ─── MLflow ──────────────────────────────────────────────────────────────────
 mlflow:
@@ -113,5 +168,15 @@ mlflow:
 
 # ─── Model Promotion ─────────────────────────────────────────────────────────
 promotion:
-  # Candidate must improve MAE by at least this fraction to be promoted
-  min_mae_improvement_fraction: 0.01
+  min_mae_improvement_fraction: 0.01    # Must improve MAE by >= 1% to promote
+  max_late_prediction_pct: 60.0         # Reject if >60% of endpoint preds are late
+  eval_protocol: "endpoint"             # Use endpoint MAE for promotion decisions
+
+# ─── Simulated Live Monitoring ───────────────────────────────────────────────
+simulation:
+  enabled: true
+  default_dataset_id: "FD001"
+  default_speed_seconds: 0.5            # Seconds between simulated cycles
+  min_speed: 0.05
+  max_speed: 3.0
+  clearly_labelled_as_simulation: true  # UI must show SIMULATION banner
